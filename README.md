@@ -1,7 +1,5 @@
 # PyLink IRC Services
 
-## END OF LIFE NOTICE: This project is no longer maintained. So long and thanks for all the fish.
-
 <!--
 [![Latest stable release](https://img.shields.io/github/v/tag/jlu5/pylink?label=stable&color=1a1)](https://github.com/PyLink/PyLink/tree/master)
 [![PyPI version](https://img.shields.io/pypi/v/pylinkirc.svg?maxAge=2592000)](https://pypi.python.org/pypi/pylinkirc/)
