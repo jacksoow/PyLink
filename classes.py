@@ -77,6 +77,7 @@ class User(TSObject):
         self.ts = ts
         self.uid = uid
         self.ident = ident
+        self.realident = ident
         self.host = host
         self.realhost = realhost
         self.ip = ip
@@ -159,6 +160,7 @@ class User(TSObject):
 
         # Add the nick attribute; this isn't in __dict__ because it's a property
         fields['nick'] = self._nick
+        fields['realident'] = getattr(self, 'realident', self.ident)
 
         return fields
 
