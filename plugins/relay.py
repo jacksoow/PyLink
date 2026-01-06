@@ -2019,7 +2019,14 @@ def handle_kill(irc, numeric, command, args):
 
     # Target user was remote:
     if realuser and realuser[0] != irc.name:
-        del relayusers[realuser][irc.name]
+        relay_entry = relayusers.get(realuser)
+        if relay_entry and irc.name in relay_entry:
+            del relay_entry[irc.name]
+            if not relay_entry:
+                relayusers.pop(realuser, None)
+        else:
+            log.debug('(%s) relay.handle_kill: no relayusers cache entry for %r on %s',
+                      irc.name, realuser, irc.name)
         fwd_reason = 'KILL FWD from %s/%s: %s' % (irc.get_friendly_name(numeric), irc.name, args['text'])
 
         origirc = world.networkobjects[realuser[0]]
@@ -2041,7 +2048,7 @@ def handle_kill(irc, numeric, command, args):
 
             iterate_all(irc, _relay_kill_loop)
 
-            del relayusers[realuser]
+            relayusers.pop(realuser, None)
         else:
             # Otherwise, forward kills as kicks where applicable.
             for homechan in origirc.users[realuser[1]].channels.copy():
