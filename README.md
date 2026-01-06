@@ -31,7 +31,7 @@ Please report any bugs you find to the [issue tracker](https://github.com/PyLink
 
 If you are a developer and want to help make PyLink more portable, patches are welcome.
 
-### Installing from source
+### Installing
 
 1) First, make sure the following dependencies are met:
 
@@ -48,36 +48,6 @@ If you are a developer and want to help make PyLink more portable, patches are w
 3) Install PyLink using `python3 setup.py install` (global install) or `python3 setup.py install --user` (local install)
     * Note: `--user` is a *literal* string; *do not* replace it with your username.
     *  **Whenever you switch branches or update PyLink's sources via `git pull`, you will need to re-run this command for changes to apply!**
-
-### Installing via Docker
-
-As of PyLink 3.0 there is a Docker image available on Docker Hub: [jlu5/pylink](https://hub.docker.com/r/jlu5/pylink)
-
-It supports the following tags:
-
-- Rolling tags: **`latest`** (latest stable/RC release), **`latest-beta`** (latest beta snapshot)
-- Pinned to a major branch: e.g. **`3`** (latest 3.x stable release), **`3-beta`** (latest 3.x beta snapshot)
-- Pinned to a specific version: e.g. **`3.0.0`**
-
-To use this image you should mount your configuration/DB folder into `/pylink`. **Make sure this directory is writable by UID 10000.**
-
-```bash
-$ docker run -v $HOME/pylink:/pylink jlu5/pylink
-```
-
-### Installing via PyPI (stable branch only)
-
-1) Make sure you're running the right pip command: on most distros, pip for Python 3 uses the command `pip3`.
-
-2) Run `pip3 install pylinkirc` to download and install PyLink. pip will automatically resolve dependencies.
-
-3) Download or copy https://github.com/PyLink/PyLink/blob/master/example-conf.yml for an example configuration.
-
-## Configuration
-
-1) Rename `example-conf.yml` to `pylink.yml` (or a similarly named `.yml` file) and configure your instance there.
-
-2) Run `pylink` from the command line. PyLink will load its configuration from `pylink.yml` by default, but you can override this by running `pylink` with a config argument (e.g. `pylink mynet.yml`).
 
 ## Supported IRCds
 
