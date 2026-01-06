@@ -56,7 +56,7 @@ If you are a developer and want to help make PyLink more portable, patches are w
 These IRCds (in alphabetical order) are frequently tested and well supported. If any issues occur, please file a bug on the issue tracker.
 
 * [InspIRCd](http://www.inspircd.org/) (2.0 - 3.x - 4.x) - module `inspircd`
-    - Set the `target_version` option to `insp4` to target InspIRCd 4.x, `insp3` to target InspIRCd 3.x (default), or `insp20` to target InspIRCd 2.0 (legacy).
+    - Set the `target_version` option to `insp4` to target InspIRCd 4.x (new), `insp3` to target InspIRCd 3.x (default), or `insp20` to target InspIRCd 2.0 (legacy).
     - For vHost setting to work, `m_chghost.so` must be loaded. For ident and realname changing support, `m_chgident.so` and `m_chgname.so` must be loaded respectively.
     - Supported channel, user, and prefix modes are negotiated on connect, but hotloading modules that change these is not supported. After changing module configuration, it is recommended to SQUIT PyLink to force a protocol renegotiation.
 * [Nefarious IRCu](https://github.com/evilnet/nefarious2) (2.0.0+) - module `p10`
