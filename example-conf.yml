@@ -205,8 +205,9 @@ servers:
         # InspIRCd specific option: sets the target InspIRCd protocol version.
         # Valid values include:
         #  "insp3"  - InspIRCd 3.x   (1205) [DEFAULT]
+        #  "insp4"  - InspIRCd 4.x   (1205) [new]
         #  "insp20" - InspIRCd 2.0.x (1202) [legacy, deprecated]
-        #target_version: insp3
+        target_version: insp3
 
         # Sets the max nick length for the network. It is important that this is set correctly, or
         # PyLink might introduce a nick that is too long and cause netsplits!
@@ -261,6 +262,7 @@ servers:
         #channels: ["#pylink"]
         #pylink_channels: ["#services"]
         #automode_channels: ["#chat"]
+        #antispam_channels: ["#pylink"]
 
         # Encoding: allows you to override the network's encoding. This can be useful for networks
         # using m_nationalchars or something similar. Encoding defaults to utf-8 if not set, and
@@ -617,6 +619,9 @@ plugins:
     # Raw plugin: Provides a 'raw' command for sending raw text to IRC.
     # Not supported outside Clientbot networks!
     #- raw
+
+    # Games plugin: 
+    #- games
 
 logging:
     # This configuration block defines targets that PyLink should log commands,
