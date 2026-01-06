@@ -1,3 +1,13 @@
+# PyLink 3.2.0 (2025-01-06)
+
+### Feature changes
+
+- Support InspIRCd 4.x
+
+### Bug fixes
+
+- Fix a Kill crash when the user don't stop reconnect
+
 # PyLink 3.1.0 (2023-01-03)
 
 This will be my (**@jlu5**'s) last release.
