@@ -1,5 +1,5 @@
 """
-inspircd.py: InspIRCd 2.0, 3.x protocol module for PyLink.
+inspircd.py: InspIRCd 2.0, 3.x, 4.x protocol module for PyLink.
 """
 
 import threading
@@ -16,10 +16,10 @@ __all__ = ['InspIRCdProtocol']
 class InspIRCdProtocol(TS6BaseProtocol):
 
     S2S_BUFSIZE = 0  # InspIRCd allows infinitely long S2S messages, so set bufsize to infinite
-    SUPPORTED_IRCDS = ['insp20', 'insp3']
+    SUPPORTED_IRCDS = ['insp20', 'insp3', 'insp4']
     DEFAULT_IRCD = SUPPORTED_IRCDS[1]
 
-    MAX_PROTO_VER = 1205  # anything above this warns (not officially supported)
+    MAX_PROTO_VER = 1206  # anything above this warns (not officially supported)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -42,6 +42,8 @@ class InspIRCdProtocol(TS6BaseProtocol):
             self.proto_ver = 1202
         elif ircd_target == 'insp3':
             self.proto_ver = 1205
+        elif ircd_target == 'insp4':
+            self.proto_ver = 1206
         else:
             raise ProtocolError("Unsupported target_version %r: supported values include %s" % (ircd_target, self.SUPPORTED_IRCDS))
         log.debug('(%s) inspircd: using protocol version %s for target_version %r', self.name, self.proto_ver, ircd_target)
@@ -55,6 +57,31 @@ class InspIRCdProtocol(TS6BaseProtocol):
         # Settable by plugins (e.g. relay) as needed, used to work around +j being triggered
         # by bursting users.
         self._endburst_delay = 0
+
+    def _normalize_module_name(self, module):
+        """Normalizes InspIRCd module names across protocol versions."""
+        if not module:
+            return ''
+
+        module = module.split('=', 1)[0].lower()
+        if module.startswith('m_'):
+            module = module[2:]
+        if module.endswith('.so'):
+            module = module[:-3]
+        return module
+
+    def _add_module_support(self, module):
+        module = self._normalize_module_name(module)
+        if module:
+            self._modsupport.add(module)
+
+    def _remove_module_support(self, module):
+        module = self._normalize_module_name(module)
+        if module:
+            self._modsupport.discard(module)
+
+    def _has_module(self, module):
+        return self._normalize_module_name(module) in self._modsupport
 
     ### Outgoing commands
 
@@ -81,15 +108,24 @@ class InspIRCdProtocol(TS6BaseProtocol):
         u = self.users[uid] = User(self, nick, ts, uid, server, ident=ident, host=host,
                                    realname=realname, realhost=realhost, ip=ip,
                                    manipulatable=manipulatable, opertype=opertype)
+        u.realident = ident
 
         self.apply_modes(uid, modes)
         self.servers[server].users.add(uid)
 
-        self._send_with_prefix(server, "UID {uid} {ts} {nick} {realhost} {host} {ident} {ip}"
-                               " {ts} {modes} + :{realname}".format(ts=ts, host=host,
-                               nick=nick, ident=ident, uid=uid,
-                               modes=raw_modes, ip=ip, realname=realname,
-                               realhost=realhost))
+        if self.proto_ver >= 1206:
+            payload = ("UID {uid} {ts} {nick} {realhost} {host} {realident} {ident} {ip}"
+                       " {ts} {modes} + :{realname}").format(ts=ts, host=host,
+                       nick=nick, ident=ident, uid=uid, realident=ident,
+                       modes=raw_modes, ip=ip, realname=realname,
+                       realhost=realhost)
+        else:
+            payload = ("UID {uid} {ts} {nick} {realhost} {host} {ident} {ip}"
+                       " {ts} {modes} + :{realname}").format(ts=ts, host=host,
+                       nick=nick, ident=ident, uid=uid,
+                       modes=raw_modes, ip=ip, realname=realname,
+                       realhost=realhost)
+        self._send_with_prefix(server, payload)
         if ('o', None) in modes or ('+o', None) in modes:
             self._oper_up(uid, opertype)
         return u
@@ -296,27 +332,35 @@ class InspIRCdProtocol(TS6BaseProtocol):
             # It is one of our clients, use FIDENT/HOST/NAME.
             if field == 'IDENT':
                 self.users[target].ident = text
-                self._send_with_prefix(target, 'FIDENT %s' % text)
+                self.users[target].realident = text
+                if getattr(self, 'remote_proto_ver', self.proto_ver) >= 1206:
+                    self._send_with_prefix(target, 'FIDENT %s *' % text)
+                else:
+                    self._send_with_prefix(target, 'FIDENT %s' % text)
             elif field == 'HOST':
                 self.users[target].host = text
-                self._send_with_prefix(target, 'FHOST %s' % text)
+                if getattr(self, 'remote_proto_ver', self.proto_ver) >= 1206:
+                    self._send_with_prefix(target, 'FHOST %s *' % text)
+                else:
+                    self._send_with_prefix(target, 'FHOST %s' % text)
             elif field in ('REALNAME', 'GECOS'):
                 self.users[target].realname = text
                 self._send_with_prefix(target, 'FNAME :%s' % text)
         else:
             # It is a client on another server, use CHGIDENT/HOST/NAME.
             if field == 'IDENT':
-                if 'm_chgident.so' not in self._modsupport:
+                if not self._has_module('m_chgident.so'):
                     raise NotImplementedError('Cannot change idents as m_chgident.so is not loaded')
 
                 self.users[target].ident = text
+                self.users[target].realident = text
                 self._send_with_prefix(self.sid, 'CHGIDENT %s %s' % (target, text))
 
                 # Send hook payloads for other plugins to listen to.
                 self.call_hooks([self.sid, 'CHGIDENT',
                                    {'target': target, 'newident': text}])
             elif field == 'HOST':
-                if 'm_chghost.so' not in self._modsupport:
+                if not self._has_module('m_chghost.so'):
                     raise NotImplementedError('Cannot change hosts as m_chghost.so is not loaded')
 
                 self.users[target].host = text
@@ -326,7 +370,7 @@ class InspIRCdProtocol(TS6BaseProtocol):
                                    {'target': target, 'newhost': text}])
 
             elif field in ('REALNAME', 'GECOS'):
-                if 'm_chgname.so' not in self._modsupport:
+                if not self._has_module('m_chgname.so'):
                     raise NotImplementedError('Cannot change real names as m_chgname.so is not loaded')
 
                 self.users[target].realname = text
@@ -467,9 +511,13 @@ class InspIRCdProtocol(TS6BaseProtocol):
         f('CAPAB END')
 
         host = self.serverdata["hostname"]
-        f('SERVER {host} {Pass} 0 {sid} :{sdesc}'.format(host=host,
-          Pass=self.serverdata["sendpass"], sid=self.sid,
-          sdesc=self.serverdata.get('serverdesc') or conf.conf['pylink']['serverdesc']))
+        if self.proto_ver >= 1205:
+            server_line = 'SERVER {host} {Pass} {sid} :{sdesc}'
+        else:
+            server_line = 'SERVER {host} {Pass} 0 {sid} :{sdesc}'
+        f(server_line.format(host=host,
+            Pass=self.serverdata["sendpass"], sid=self.sid,
+            sdesc=self.serverdata.get('serverdesc') or conf.conf['pylink']['serverdesc']))
 
         self._send_with_prefix(self.sid, 'BURST %s' % ts)
 
@@ -517,9 +565,15 @@ class InspIRCdProtocol(TS6BaseProtocol):
                                     "At least %s is needed. (got %s)" %
                                     (self.proto_ver, protocol_version))
             elif protocol_version > self.MAX_PROTO_VER:
-                log.warning("(%s) PyLink support for InspIRCd > 3.x is experimental, "
+                log.warning("(%s) PyLink support for InspIRCd > 4.x is experimental, "
                             "and should not be relied upon for anything important.",
                             self.name)
+            elif protocol_version >= 1206 > self.proto_ver:
+                log.warning("(%s) PyLink 3.1+ introduces native support for InspIRCd 4. "
+                            "Enable this by setting 'target_version' to 'insp4' in your InspIRCd "
+                            "server block. Otherwise, some features will not work correctly!",
+                            self.name)
+                log.warning("(%s) Falling back to InspIRCd 3 compatibility mode.", self.name)
             elif protocol_version >= 1205 > self.proto_ver:
                 log.warning("(%s) PyLink 3.0 introduces native support for InspIRCd 3. "
                             "You should enable this by setting the 'target_version' option in your "
@@ -637,10 +691,12 @@ class InspIRCdProtocol(TS6BaseProtocol):
             log.debug("(%s) handle_capab: capabilities list is %s", self.name, caps)
 
             # Store the max nick and channel lengths
-            if 'NICKMAX' in caps:
-                self.maxnicklen = int(caps['NICKMAX'])
-            if 'CHANMAX' in caps:
-                self.maxchanlen = int(caps['CHANMAX'])
+            nickmax = caps.get('NICKMAX') or caps.get('MAXNICK')
+            if nickmax:
+                self.maxnicklen = int(nickmax)
+            chanmax = caps.get('CHANMAX') or caps.get('MAXCHANNEL')
+            if chanmax:
+                self.maxchanlen = int(chanmax)
             # Casemapping - this is only sent in InspIRCd 3.x
             if 'CASEMAPPING' in caps:
                 self.casemapping = caps['CASEMAPPING']
@@ -663,7 +719,8 @@ class InspIRCdProtocol(TS6BaseProtocol):
 
         elif args[0] == 'MODSUPPORT':
             # <- CAPAB MODSUPPORT :m_alltime.so m_check.so m_chghost.so m_chgident.so m_chgname.so m_fullversion.so m_gecosban.so m_knock.so m_muteban.so m_nicklock.so m_nopartmsg.so m_opmoderated.so m_sajoin.so m_sanick.so m_sapart.so m_serverban.so m_services_account.so m_showwhois.so m_silence.so m_swhois.so m_uninvite.so m_watch.so
-            self._modsupport |= set(args[-1].split())
+            for module in args[-1].split():
+                self._add_module_support(module)
 
     def handle_kick(self, source, command, args):
         """Handles incoming KICKs."""
@@ -769,15 +826,35 @@ class InspIRCdProtocol(TS6BaseProtocol):
     def handle_uid(self, numeric, command, args):
         """Handles incoming UID commands (user introduction)."""
         # :70M UID 70MAAAAAB 1429934638 jlu5 0::1 hidden-7j810p.9mdf.lrek.0000.0000.IP jlu5 0::1 1429934638 +Wioswx +ACGKNOQXacfgklnoqvx :realname
-        uid, ts, nick, realhost, host, ident, ip = args[0:7]
+        uid = args[0]
+        ts = int(args[1])
+        nick = args[2]
+        realhost = args[3]
 
-        ts = int(ts)
+        if getattr(self, 'remote_proto_ver', self.proto_ver) >= 1206:
+            host = args[4]
+            realident = args[5]
+            ident = args[6]
+            ip = args[7]
+            signon_idx = 8
+        else:
+            host = args[4]
+            ident = args[5]
+            realident = ident
+            ip = args[6]
+            signon_idx = 7
 
         self._check_nick_collision(nick)
         realname = args[-1]
         self.users[uid] = userobj = User(self, nick, ts, uid, numeric, ident, host, realname, realhost, ip)
+        userobj.realident = realident
 
-        parsedmodes = self.parse_modes(uid, [args[8], args[9]])
+        mode_tokens = args[signon_idx + 1:-1]
+        if not mode_tokens:
+            mode_tokens = ['+']
+        elif len(mode_tokens) == 1:
+            mode_tokens.append('+')
+        parsedmodes = self.parse_modes(uid, mode_tokens)
         self.apply_modes(uid, parsedmodes)
 
         self._check_oper_status_change(uid, parsedmodes)
@@ -792,7 +869,16 @@ class InspIRCdProtocol(TS6BaseProtocol):
         if self.uplink is None:
             # <- SERVER whatever.net abcdefgh 0 10X :some server description
             servername = args[0].lower()
-            source = args[3]
+            if self.proto_ver >= 1205:
+                try:
+                    source = args[2]
+                except IndexError:
+                    raise ProtocolError('Malformed SERVER introduction from uplink (missing SID)')
+            else:
+                try:
+                    source = args[3]
+                except IndexError:
+                    raise ProtocolError('Malformed SERVER introduction from uplink (missing SID)')
 
             if args[1] != self.serverdata['recvpass']:
                  # Check if recvpass is correct
@@ -905,14 +991,28 @@ class InspIRCdProtocol(TS6BaseProtocol):
     def handle_fident(self, numeric, command, args):
         """Handles FIDENT, used for denoting ident changes."""
         # <- :70MAAAAAB FIDENT test
-        self.users[numeric].ident = newident = args[0]
-        return {'target': numeric, 'newident': newident}
+        display_ident = args[0]
+        real_ident = args[1] if len(args) > 1 else None
+
+        if display_ident != '*':
+            self.users[numeric].ident = display_ident
+        if real_ident and real_ident != '*':
+            self.users[numeric].realident = real_ident
+
+        return {'target': numeric, 'newident': self.users[numeric].ident}
 
     def handle_fhost(self, numeric, command, args):
         """Handles FHOST, used for denoting hostname changes."""
         # <- :70MAAAAAB FHOST some.host
-        self.users[numeric].host = newhost = args[0]
-        return {'target': numeric, 'newhost': newhost}
+        display_host = args[0]
+        real_host = args[1] if len(args) > 1 else None
+
+        if display_host != '*':
+            self.users[numeric].host = display_host
+        if real_host and real_host != '*':
+            self.users[numeric].realhost = real_host
+
+        return {'target': numeric, 'newhost': self.users[numeric].host}
 
     def handle_fname(self, numeric, command, args):
         """Handles FNAME, used for denoting real name/gecos changes."""
@@ -987,10 +1087,10 @@ class InspIRCdProtocol(TS6BaseProtocol):
             for module in args[-1].split():
                 if module.startswith('-'):
                     log.debug('(%s) Removing module %s', self.name, module[1:])
-                    self._modsupport.discard(module[1:])
+                    self._remove_module_support(module[1:])
                 elif module.startswith('+'):
                     log.debug('(%s) Adding module %s', self.name, module[1:])
-                    self._modsupport.add(module[1:])
+                    self._add_module_support(module[1:])
                 else:
                     log.warning('(%s) Got unknown METADATA modules string: %r', self.name, args[-1])
         elif args[1] == 'ssl_cert' and uid in self.users:
