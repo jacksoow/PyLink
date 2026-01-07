@@ -623,6 +623,9 @@ plugins:
     # Games plugin: 
     #- games
 
+    # Telegram plugin: Load the Telegram relay plugin
+    #- telegram
+
 logging:
     # This configuration block defines targets that PyLink should log commands,
     # errors, etc., to.
@@ -1053,3 +1056,50 @@ stats:
     # the contents of which will be *merged* into the global list of bad strings specified below.
     #partquit_globs:
         # - "*some-spammy-site.xyz*"
+
+#telegram:
+  #enabled: true   # Enable or disable the Telegram plugin
+
+  # -------------------------------------------------------
+  # Telegram Bot configuration
+  # -------------------------------------------------------
+  #bot:
+    #token: "123456:ABCDEF"   # Telegram Bot API token
+
+  # -------------------------------------------------------
+  # IRC identity for fake Telegram users
+  # -------------------------------------------------------
+  #identity:
+    #suffix: "Telegram"        # Nickname suffix (e.g. nick/Telegram)
+    #ident: "telegram"         # Ident/username shown on IRC
+    #host: "telegram.bridge"   # Hostname shown on IRC
+
+  # -------------------------------------------------------
+  # Limits and safety controls
+  # -------------------------------------------------------
+  #limits:
+    #nick_max: 25              # Maximum IRC nickname length
+    #message_max: 400          # Maximum message length relayed to IRC
+
+  # -------------------------------------------------------
+  # Idle cleanup (fake user timeout)
+  # -------------------------------------------------------
+  #cleanup:
+    #idle_timeout: 3600        # Seconds before removing inactive Telegram users (0 = disabled)
+
+  # -------------------------------------------------------
+  # Telegram <-> IRC channel bridges
+  # Each Telegram chat is mapped to one IRC channel
+  # -------------------------------------------------------
+  #bridges:
+    #- irc:
+        #network: "interirc"   # IRC network name (must match PyLink config)
+        #channel: "#chat"      # IRC channel to bridge
+      #telegram:
+        #chat_id: "-1001111111111"   # Telegram group or channel ID
+
+    #- irc:
+        #network: "interirc"
+        #channel: "#support"
+      #telegram:
+        #chat_id: "-1002222222222"
