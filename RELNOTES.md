@@ -1,4 +1,10 @@
-# PyLink 3.2.0 (2025-01-06)
+# PyLink 3.2.1-alpha (2026-XX-XX)
+
+### Feature changes
+
+- Insert New Plugin: Telegram
+
+# PyLink 3.2.0 (2026-01-06)
 
 ### Feature changes
 
