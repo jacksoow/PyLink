@@ -1,4 +1,4 @@
-# PyLink 3.2.1-alpha (2026-XX-XX)
+# PyLink 3.2.1-alpha (2026-01-07)
 
 ### Feature changes
 
