@@ -12,6 +12,33 @@ from pylinkirc.protocols.ts6_common import TS6BaseProtocol
 
 __all__ = ['InspIRCdProtocol']
 
+# Mapeamento de nomes de extbans do InspIRCd 4 (CAPAB EXTBANS) para nomes internos do PyLink
+INSP4_ACTING_EXTBAN_MAP = {
+    'mute': 'quiet',
+    'quiet': 'quiet',
+    'nickchange': 'ban_nonick',
+    'nonick': 'ban_nonick',
+    'blockcolor': 'ban_blockcolor',
+    'partmsg': 'ban_partmsgs',
+    'invite': 'ban_invites',
+    'anticaps': 'ban_blockcaps',
+    'blockcaps': 'ban_blockcaps',
+    'noctcp': 'ban_noctcp',
+    'nokick': 'ban_nokicks',
+    'stripcolor': 'ban_stripcolor',
+    'nonotice': 'ban_nonotice',
+}
+
+INSP4_MATCHING_EXTBAN_MAP = {
+    'channel': 'ban_inchannel',
+    'realname': 'ban_realname',
+    'server': 'ban_server',
+    'fingerprint': 'ban_certfp',
+    'opertype': 'ban_opertype',
+    'account': 'ban_account',
+    'unregistered': 'ban_unregistered_matching',
+}
+
 
 class InspIRCdProtocol(TS6BaseProtocol):
 
@@ -26,16 +53,13 @@ class InspIRCdProtocol(TS6BaseProtocol):
 
         self.protocol_caps |= {'slash-in-nicks', 'slash-in-hosts', 'underscore-in-hosts'}
 
-        # This is only the default value - on InspIRCd 3 it will be negotiated on connect in CAPAB CAPABILITIES
-        self.casemapping = 'rfc1459'
-
         # Raw commands sent from servers vary from protocol to protocol. Here, we map
         # non-standard names to our hook handlers, so command handlers' outputs
         # are called with the right hooks.
         self.hook_map = {'FJOIN': 'JOIN', 'RSQUIT': 'SQUIT', 'FMODE': 'MODE',
-                         'FTOPIC': 'TOPIC', 'OPERTYPE': 'MODE', 'FHOST': 'CHGHOST',
-                         'FIDENT': 'CHGIDENT', 'FNAME': 'CHGNAME', 'SVSTOPIC': 'TOPIC',
-                         'SAKICK': 'KICK', 'IJOIN': 'JOIN'}
+                         'LMODE': 'MODE', 'FTOPIC': 'TOPIC', 'OPERTYPE': 'MODE',
+                         'FHOST': 'CHGHOST', 'FIDENT': 'CHGIDENT', 'FNAME': 'CHGNAME',
+                         'SVSTOPIC': 'TOPIC', 'SAKICK': 'KICK', 'IJOIN': 'JOIN'}
 
         ircd_target = self.serverdata.get('target_version', self.DEFAULT_IRCD).lower()
         if ircd_target == 'insp20':
@@ -45,18 +69,64 @@ class InspIRCdProtocol(TS6BaseProtocol):
         elif ircd_target == 'insp4':
             self.proto_ver = 1206
         else:
-            raise ProtocolError("Unsupported target_version %r: supported values include %s" % (ircd_target, self.SUPPORTED_IRCDS))
-        log.debug('(%s) inspircd: using protocol version %s for target_version %r', self.name, self.proto_ver, ircd_target)
+            raise ProtocolError("Unsupported target_version %r: supported values include %s" %
+                                (ircd_target, self.SUPPORTED_IRCDS))
+        log.debug('(%s) inspircd: using protocol version %s for target_version %r',
+                  self.name, self.proto_ver, ircd_target)
 
-        # Track prefix mode levels on InspIRCd 3
+    def _init_vars(self, *args, **kwargs):
+        super()._init_vars(*args, **kwargs)
+
+        # Default casemapping - on InspIRCd 3/4 this is negotiated via CAPAB CAPABILITIES
+        self.casemapping = 'rfc1459'
+
+        # Remote protocol version reported in CAPAB START
+        self.remote_proto_ver = None
+
+        # Tracks whether our CAPAB/SERVER/BURST handshake was already sent
+        self._handshake_sent = False
+
+        # Track prefix mode levels on InspIRCd 3/4
         self._prefix_levels = {}
 
-        # Track the modules supported by the uplink.
+        # Track the modules supported by the uplink
         self._modsupport = set()
 
         # Settable by plugins (e.g. relay) as needed, used to work around +j being triggered
         # by bursting users.
         self._endburst_delay = 0
+
+        # Default extban definitions (may be updated dynamically by CAPAB EXTBANS on InspIRCd 4)
+        self.extbans_acting = {
+            'quiet': 'm:', 'ban_nonick': 'N:', 'ban_blockcolor': 'c:',
+            'ban_partmsgs': 'p:', 'ban_invites': 'A:', 'ban_blockcaps': 'B:',
+            'ban_noctcp': 'C:', 'ban_nokicks': 'Q:', 'ban_stripcolor': 'S:',
+            'ban_nonotice': 'T:',
+        }
+        self.extbans_matching = {
+            'ban_inchannel': 'j:', 'ban_realname': 'r:', 'ban_server': 's:',
+            'ban_certfp': 'z:', 'ban_opertype': 'O:', 'ban_account': 'R:',
+            # Note: InspIRCd /helpop refers to this as an acting extban, but
+            # it actually behaves as a matching one...
+            'ban_unregistered_matching': 'U:',
+        }
+
+    @property
+    def negotiated_proto_ver(self):
+        """Returns the effective negotiated protocol version (minimum of local and remote)."""
+        if self.remote_proto_ver is None:
+            return self.proto_ver
+        return min(self.proto_ver, self.remote_proto_ver)
+
+    def handle_events(self, line):
+        """Strips IRCv3 message tags (used natively in InspIRCd 4 / protocol 1206) before parsing."""
+        if line.startswith('@'):
+            parts = line.split(' ', 1)
+            if len(parts) < 2:
+                log.debug('(%s) inspircd: ignoring tag-only line: %r', self.name, line)
+                return
+            line = parts[1].lstrip(' ')
+        return super().handle_events(line)
 
     def _normalize_module_name(self, module):
         """Normalizes InspIRCd module names across protocol versions."""
@@ -113,15 +183,19 @@ class InspIRCdProtocol(TS6BaseProtocol):
         self.apply_modes(uid, modes)
         self.servers[server].users.add(uid)
 
-        if self.proto_ver >= 1206:
+        if self.negotiated_proto_ver >= 1206:
+            # InspIRCd 4 (1206):
+            # :<sid> UID <uid> <age> <nick> <realhost> <dhost> <realuser> <duser> <ip> <signon> <modes> [<params>...] :<realname>
             payload = ("UID {uid} {ts} {nick} {realhost} {host} {realident} {ident} {ip}"
-                       " {ts} {modes} + :{realname}").format(ts=ts, host=host,
+                       " {ts} {modes} :{realname}").format(ts=ts, host=host,
                        nick=nick, ident=ident, uid=uid, realident=ident,
                        modes=raw_modes, ip=ip, realname=realname,
                        realhost=realhost)
         else:
+            # InspIRCd 2/3 (1202/1205):
+            # :<sid> UID <uid> <age> <nick> <realhost> <dhost> <duser> <ip> <signon> <modes> [<params>...] :<realname>
             payload = ("UID {uid} {ts} {nick} {realhost} {host} {ident} {ip}"
-                       " {ts} {modes} + :{realname}").format(ts=ts, host=host,
+                       " {ts} {modes} :{realname}").format(ts=ts, host=host,
                        nick=nick, ident=ident, uid=uid,
                        modes=raw_modes, ip=ip, realname=realname,
                        realhost=realhost)
@@ -142,7 +216,7 @@ class InspIRCdProtocol(TS6BaseProtocol):
             raise LookupError('No such PyLink client exists.')
 
         # Strip out list-modes, they shouldn't be ever sent in FJOIN.
-        modes = [m for m in self._channels[channel].modes if m[0] not in self.cmodes['*A']]
+        modes = [m for m in self._channels[channel].modes if m[0][-1] not in self.cmodes['*A']]
         self._send_with_prefix(server, "FJOIN {channel} {ts} {modes} :,{uid}".format(
                 ts=self._channels[channel].ts, uid=client, channel=channel,
                 modes=self.join_modes(modes)))
@@ -157,7 +231,7 @@ class InspIRCdProtocol(TS6BaseProtocol):
         <users> is a list of (prefix mode, UID) pairs:
 
         Example uses:
-            sjoin('100', '#test', [('', '100AAABBC'), ('qo', 100AAABBB'), ('h', '100AAADDD')])
+            sjoin('100', '#test', [('', '100AAABBC'), ('qo', '100AAABBB'), ('h', '100AAADDD')])
             sjoin(self.sid, '#test', [('o', self.pseudoclient.uid)])
         """
         server = server or self.sid
@@ -177,7 +251,7 @@ class InspIRCdProtocol(TS6BaseProtocol):
         for mode in modes:
             modechar = mode[0][-1]
             if modechar in self.cmodes['*A']:
-                # Track bans separately (they are sent as a normal FMODE instead of in FJOIN.
+                # Track bans separately (they are sent as a normal FMODE instead of in FJOIN).
                 # However, don't reset bans that have already been set.
                 if (modechar, mode[1]) not in self._channels[channel].modes:
                     banmodes.append(mode)
@@ -204,13 +278,13 @@ class InspIRCdProtocol(TS6BaseProtocol):
         namelist = ' '.join(namelist)
         self._send_with_prefix(server, "FJOIN {channel} {ts} {modes} :{users}".format(
                 ts=ts, users=namelist, channel=channel,
-                modes=self.join_modes(modes)))
+                modes=self.join_modes(regularmodes)))
         self._channels[channel].users.update(uids)
 
         if banmodes:
             # Burst ban modes if there are any.
             # <- :1ML FMODE #test 1461201525 +bb *!*@bad.user *!*@rly.bad.user
-            self._send_with_prefix(server, "FMODE {channel} {ts} {modes} ".format(
+            self._send_with_prefix(server, "FMODE {channel} {ts} {modes}".format(
                 ts=ts, channel=channel, modes=self.join_modes(banmodes)))
 
         self.updateTS(server, channel, ts, changedmodes)
@@ -220,27 +294,21 @@ class InspIRCdProtocol(TS6BaseProtocol):
 
         This should be called whenever user mode +o is set on anyone, because
         InspIRCd requires a special command (OPERTYPE) to be sent in order to
-        recognize ANY non-burst oper ups.
-
-        Plugins don't have to call this function themselves, but they can
-        set the opertype attribute of an User object (in self.users),
-        and the change will be reflected here."""
+        recognize ANY non-burst oper ups."""
         userobj = self.users[target]
         try:
             otype = opertype or userobj.opertype or 'IRC Operator'
         except AttributeError:
             log.debug('(%s) opertype field for %s (%s) isn\'t filled yet!',
                       self.name, target, userobj.nick)
-            # whatever, this is non-standard anyways.
             otype = 'IRC Operator'
         assert otype, "Tried to send an empty OPERTYPE!"
         log.debug('(%s) Sending OPERTYPE from %s to oper them up.',
                   self.name, target)
         userobj.opertype = otype
 
-        # InspIRCd 2.x uses _ in OPERTYPE to denote spaces, while InspIRCd 3.x does not.
-        # This is one of the few things not fixed by 2.0/3.0 link compat, so here's a workaround
-        if self.remote_proto_ver < 1205:
+        # InspIRCd 2.x uses _ in OPERTYPE to denote spaces, while InspIRCd 3.x/4.x use trailing text.
+        if self.negotiated_proto_ver < 1205:
             otype = otype.replace(" ", "_")
         else:
             otype = ':' + otype
@@ -249,16 +317,12 @@ class InspIRCdProtocol(TS6BaseProtocol):
 
     def mode(self, numeric, target, modes, ts=None):
         """Sends mode changes from a PyLink client/server."""
-        # -> :9PYAAAAAA FMODE #pylink 1433653951 +os 9PYAAAAAA
-        # -> :9PYAAAAAA MODE 9PYAAAAAA -i+w
-
         if (not self.is_internal_client(numeric)) and \
                 (not self.is_internal_server(numeric)):
             raise LookupError('No such PyLink client/server exists.')
 
         if ('+o', None) in modes and not self.is_channel(target):
-            # https://github.com/inspircd/inspircd/blob/master/src/modules/m_spanningtree/opertype.cpp#L26-L28
-            # Servers need a special command to set umode +o on people.
+            # Servers need OPERTYPE to set umode +o on people.
             self._oper_up(target)
 
         self.apply_modes(target, modes)
@@ -276,16 +340,12 @@ class InspIRCdProtocol(TS6BaseProtocol):
                 (not self.is_internal_server(numeric)):
             raise LookupError('No such PyLink client/server exists.')
 
-        # InspIRCd will show the raw kill message sent from our server as the quit message.
-        # So, make the kill look actually like a kill instead of someone quitting with
-        # an arbitrary message.
         if numeric in self.servers:
             sourcenick = self.servers[numeric].name
         else:
             sourcenick = self.users[numeric].nick
 
         self._send_with_prefix(numeric, 'KILL %s :Killed (%s (%s))' % (target, sourcenick, reason))
-
         self._remove_client(target)
 
     def topic(self, source, target, text):
@@ -293,8 +353,9 @@ class InspIRCdProtocol(TS6BaseProtocol):
         if not self.is_internal_client(source):
             raise LookupError('No such PyLink client exists.')
 
-        if self.proto_ver >= 1205:
-            self._send_with_prefix(source, 'FTOPIC %s %s %s :%s' % (target, self._channels[target].ts, int(time.time()), text))
+        if self.negotiated_proto_ver >= 1205:
+            self._send_with_prefix(source, 'FTOPIC %s %s %s :%s' %
+                                   (target, self._channels[target].ts, int(time.time()), text))
         else:
             return super().topic(source, target, text)
 
@@ -306,8 +367,9 @@ class InspIRCdProtocol(TS6BaseProtocol):
         topic_ts = int(time.time())
         servername = self.servers[source].name
 
-        if self.proto_ver >= 1205:
-            self._send_with_prefix(source, 'FTOPIC %s %s %s %s :%s' % (target, self._channels[target].ts, topic_ts, servername, text))
+        if self.negotiated_proto_ver >= 1205:
+            self._send_with_prefix(source, 'FTOPIC %s %s %s %s :%s' %
+                                   (target, self._channels[target].ts, topic_ts, servername, text))
         else:
             self._send_with_prefix(source, 'FTOPIC %s %s %s :%s' % (target, topic_ts, servername, text))
 
@@ -329,17 +391,17 @@ class InspIRCdProtocol(TS6BaseProtocol):
                                       "unsupported by this protocol." % field)
 
         if self.is_internal_client(target):
-            # It is one of our clients, use FIDENT/HOST/NAME.
+            # It is one of our clients, use FIDENT/FHOST/FNAME.
             if field == 'IDENT':
                 self.users[target].ident = text
-                self.users[target].realident = text
-                if getattr(self, 'remote_proto_ver', self.proto_ver) >= 1206:
+                if self.negotiated_proto_ver >= 1206:
                     self._send_with_prefix(target, 'FIDENT %s *' % text)
                 else:
+                    self.users[target].realident = text
                     self._send_with_prefix(target, 'FIDENT %s' % text)
             elif field == 'HOST':
                 self.users[target].host = text
-                if getattr(self, 'remote_proto_ver', self.proto_ver) >= 1206:
+                if self.negotiated_proto_ver >= 1206:
                     self._send_with_prefix(target, 'FHOST %s *' % text)
                 else:
                     self._send_with_prefix(target, 'FHOST %s' % text)
@@ -347,55 +409,41 @@ class InspIRCdProtocol(TS6BaseProtocol):
                 self.users[target].realname = text
                 self._send_with_prefix(target, 'FNAME :%s' % text)
         else:
-            # It is a client on another server, use CHGIDENT/HOST/NAME.
+            # It is a client on another server, use CHGIDENT/CHGHOST/CHGNAME.
             if field == 'IDENT':
-                if not self._has_module('m_chgident.so'):
-                    raise NotImplementedError('Cannot change idents as m_chgident.so is not loaded')
+                if not self._has_module('chgident'):
+                    raise NotImplementedError('Cannot change idents as chgident module is not loaded')
 
                 self.users[target].ident = text
-                self.users[target].realident = text
                 self._send_with_prefix(self.sid, 'CHGIDENT %s %s' % (target, text))
 
-                # Send hook payloads for other plugins to listen to.
-                self.call_hooks([self.sid, 'CHGIDENT',
-                                   {'target': target, 'newident': text}])
+                self.call_hooks([self.sid, 'CHGIDENT', {'target': target, 'newident': text}])
             elif field == 'HOST':
-                if not self._has_module('m_chghost.so'):
-                    raise NotImplementedError('Cannot change hosts as m_chghost.so is not loaded')
+                if not self._has_module('chghost'):
+                    raise NotImplementedError('Cannot change hosts as chghost module is not loaded')
 
                 self.users[target].host = text
                 self._send_with_prefix(self.sid, 'CHGHOST %s %s' % (target, text))
 
-                self.call_hooks([self.sid, 'CHGHOST',
-                                   {'target': target, 'newhost': text}])
-
+                self.call_hooks([self.sid, 'CHGHOST', {'target': target, 'newhost': text}])
             elif field in ('REALNAME', 'GECOS'):
-                if not self._has_module('m_chgname.so'):
-                    raise NotImplementedError('Cannot change real names as m_chgname.so is not loaded')
+                if not self._has_module('chgname'):
+                    raise NotImplementedError('Cannot change real names as chgname module is not loaded')
 
                 self.users[target].realname = text
                 self._send_with_prefix(self.sid, 'CHGNAME %s :%s' % (target, text))
 
-                self.call_hooks([self.sid, 'CHGNAME',
-                                   {'target': target, 'newgecos': text}])
+                self.call_hooks([self.sid, 'CHGNAME', {'target': target, 'newgecos': text}])
+
     def oper_notice(self, source, text):
-        """
-        Send a message to all opers.
-        """
-        # <- :70M SNONOTICE G :From jlu5: aaaaaa
+        """Send a message to all opers."""
         self._send_with_prefix(self.sid, 'SNONOTICE G :From %s: %s' % (self.get_friendly_name(source), text))
 
     def numeric(self, source, numeric, target, text):
         """Sends raw numerics from a server to a remote client."""
-        # InspIRCd 2.0 syntax (undocumented):
-        # Essentially what this does is push the raw numeric text after the first ":" towards the
-        # given user.
-        # <- :70M PUSH 0ALAAAAAA ::midnight.vpn 422 PyLink-devel :Message of the day file is missing.
-
-        # InspIRCd 3 uses a new NUM command in this format:
-        # -> NUM <numeric source sid> <target uuid> <numeric ID> <params>
-        if self.proto_ver >= 1205:
-            self._send('NUM %s %s %s %s' % (source, target, numeric, text))
+        if self.negotiated_proto_ver >= 1205:
+            # :<sid> NUM <numeric source sid> <target uuid> <numeric ID> <params>
+            self._send_with_prefix(self.sid, 'NUM %s %s %s %s' % (source, target, numeric, text))
         else:
             self._send_with_prefix(self.sid, 'PUSH %s ::%s %s %s %s' % (target, source, numeric, target, text))
 
@@ -404,11 +452,9 @@ class InspIRCdProtocol(TS6BaseProtocol):
         if not self.is_internal_client(source):
             raise LookupError('No such PyLink client exists.')
 
-        if self.proto_ver >= 1205:  # insp3
-            # Note: insp3 supports optionally sending an invite expiration (after the TS argument),
-            # but we don't use / expose that feature yet.
+        if self.negotiated_proto_ver >= 1205:
             self._send_with_prefix(source, 'INVITE %s %s %d' % (target, channel, self._channels[channel].ts))
-        else:  # insp2
+        else:
             self._send_with_prefix(source, 'INVITE %s %s' % (target, channel))
 
     def away(self, source, text):
@@ -426,19 +472,12 @@ class InspIRCdProtocol(TS6BaseProtocol):
         defaults to the one in the config. uplink defaults to the main PyLink
         server, and sid (the server ID) is automatically generated if not
         given.
-
-        Endburst delay can be tweaked by setting the _endburst_delay variable
-        to a positive value before calling spawn_server(). This can be used to
-        prevent PyLink bursts from filling up snomasks and triggering InspIRCd +j.
         """
-        # -> :0AL SERVER test.server * 1 0AM :some silly pseudoserver
         uplink = uplink or self.sid
         name = name.lower()
-
-        # "desc" defaults to the configured server description.
         desc = desc or self.serverdata.get('serverdesc') or conf.conf['pylink']['serverdesc']
 
-        if sid is None:  # No sid given; generate one!
+        if sid is None:
             sid = self.sidgen.next_sid()
 
         assert len(sid) == 3, "Incorrect SID length"
@@ -456,43 +495,35 @@ class InspIRCdProtocol(TS6BaseProtocol):
             raise ValueError('Invalid server name %r' % name)
 
         self.servers[sid] = Server(self, uplink, name, internal=True, desc=desc)
-        if self.proto_ver >= 1205:
+        if self.negotiated_proto_ver >= 1205:
             # <- :3IN SERVER services.abc.local 0SV :Some server
             self._send_with_prefix(uplink, 'SERVER %s %s :%s' % (name, sid, desc))
         else:
             # <- :00A SERVER test.server * 1 00C :test
-            self._send_with_prefix(uplink, 'SERVER %s * %s %s :%s' % (name, self.servers[sid].hopcount, sid, desc))
-
-        # Endburst delay clutter
+            self._send_with_prefix(uplink, 'SERVER %s * %s %s :%s' %
+                                   (name, self.servers[sid].hopcount, sid, desc))
 
         def endburstf():
-            # Delay ENDBURST by X seconds if requested.
             if self._aborted.wait(self._endburst_delay):
-                # We managed to catch the abort flag before sending ENDBURST, so break
                 log.debug('(%s) stopping endburstf() for %s as aborted was set', self.name, sid)
                 return
             self._send_with_prefix(sid, 'ENDBURST')
 
         if self._endburst_delay:
-            t = threading.Thread(target=endburstf, name="protocols/inspircd delayed ENDBURST thread for %s@%s" % (sid, self.name))
+            t = threading.Thread(target=endburstf,
+                                 name="protocols/inspircd delayed ENDBURST thread for %s@%s" % (sid, self.name))
             t.daemon = True
             t.start()
-        else:  # Else, send burst immediately
+        else:
             self._send_with_prefix(sid, 'ENDBURST')
         return sid
 
     def set_server_ban(self, source, duration, user='*', host='*', reason='User banned'):
-        """
-        Sets a server ban.
-        """
-        # <- :70M ADDLINE G *@10.9.8.7 midnight.local 1433704565 0 :gib reason pls kthx
-
+        """Sets a server ban."""
         assert not (user == host == '*'), "Refusing to set ridiculous ban on *@*"
-
-        # Per https://wiki.inspircd.org/InspIRCd_Spanning_Tree_1.2/ADDLINE, the setter argument can
-        # be a max of 64 characters
-        self._send_with_prefix(source, 'ADDLINE G %s@%s %s %s %s :%s' % (user, host, self.get_friendly_name(source)[:64],
-                                                                         int(time.time()), duration, reason))
+        self._send_with_prefix(source, 'ADDLINE G %s@%s %s %s %s :%s' %
+                               (user, host, self.get_friendly_name(source)[:64],
+                                int(time.time()), duration, reason))
 
     ### Core / command handlers
 
@@ -502,64 +533,71 @@ class InspIRCdProtocol(TS6BaseProtocol):
         self._modsupport.clear()
 
     def post_connect(self):
-        """Initializes a connection to a server."""
-        ts = self.start_ts
+        """Initializes CAPAB negotiation with the uplink server.
 
+        We send CAPAB START here and complete CAPAB CAPABILITIES / CAPAB END /
+        SERVER / BURST once we receive CAPAB END from the uplink, so that we
+        mirror the uplink's CASEMAPPING and negotiated protocol version cleanly
+        (required by InspIRCd 4 / protocol 1206).
+        """
+        self._handshake_sent = False
+        self.send('CAPAB START %s' % self.proto_ver)
+
+    def _send_handshake(self):
+        """Completes CAPAB negotiation, SERVER authentication, and initial BURST."""
+        if self._handshake_sent:
+            return
+        self._handshake_sent = True
+
+        ver = self.negotiated_proto_ver
+        ts = self.start_ts
         f = self.send
-        f('CAPAB START %s' % self.proto_ver)
-        f('CAPAB CAPABILITIES :PROTOCOL=%s' % self.proto_ver)
+
+        if ver >= 1205:
+            f('CAPAB CAPABILITIES :PROTOCOL=%s CASEMAPPING=%s' % (ver, self.casemapping))
+        else:
+            f('CAPAB CAPABILITIES :PROTOCOL=%s' % ver)
         f('CAPAB END')
 
         host = self.serverdata["hostname"]
-        if self.proto_ver >= 1205:
+        sdesc = self.serverdata.get('serverdesc') or conf.conf['pylink']['serverdesc']
+        if ver >= 1205:
             server_line = 'SERVER {host} {Pass} {sid} :{sdesc}'
         else:
             server_line = 'SERVER {host} {Pass} 0 {sid} :{sdesc}'
-        f(server_line.format(host=host,
-            Pass=self.serverdata["sendpass"], sid=self.sid,
-            sdesc=self.serverdata.get('serverdesc') or conf.conf['pylink']['serverdesc']))
+        f(server_line.format(host=host, Pass=self.serverdata["sendpass"], sid=self.sid, sdesc=sdesc))
 
         self._send_with_prefix(self.sid, 'BURST %s' % ts)
 
-        # InspIRCd sends VERSION data on link, instead of when requested by a client.
-        if self.proto_ver >= 1205:
-            verstr = self.version()
-            for version_type in {'version', 'rawversion'}:
-                self._send_with_prefix(self.sid, 'SINFO %s :%s' % (version_type, verstr.split(' ', 1)[0]))
+        verstr = self.version()
+        shortver = verstr.split(' ', 1)[0]
+        if ver >= 1206:
+            self._send_with_prefix(self.sid, 'SINFO rawversion :%s' % shortver)
+            self._send_with_prefix(self.sid, 'SINFO customversion :%s' % verstr)
+        elif ver >= 1205:
+            for version_type in ('version', 'rawversion'):
+                self._send_with_prefix(self.sid, 'SINFO %s :%s' % (version_type, shortver))
             self._send_with_prefix(self.sid, 'SINFO fullversion :%s' % verstr)
         else:
-            self._send_with_prefix(self.sid, 'VERSION :%s' % self.version())
-        self._send_with_prefix(self.sid, 'ENDBURST')
+            self._send_with_prefix(self.sid, 'VERSION :%s' % verstr)
 
-        # Extban definitions
-        self.extbans_acting = {'quiet': 'm:', 'ban_nonick': 'N:', 'ban_blockcolor': 'c:',
-                               'ban_partmsgs': 'p:', 'ban_invites': 'A:', 'ban_blockcaps': 'B:',
-                               'ban_noctcp': 'C:', 'ban_nokicks': 'Q:', 'ban_stripcolor': 'S:',
-                               'ban_nonotice': 'T:'}
-        self.extbans_matching = {'ban_inchannel': 'j:', 'ban_realname': 'r:', 'ban_server': 's:',
-                                 'ban_certfp': 'z:', 'ban_opertype': 'O:', 'ban_account': 'R:',
-                                 # Note: InspIRCd /helpop refers to this as an acting extban, but
-                                 # it actually behaves as a matching one...
-                                 'ban_unregistered_matching': 'U:'}
+        self._send_with_prefix(self.sid, 'ENDBURST')
 
     def handle_capab(self, source, command, args):
         """
-        Handles the CAPAB command, used for capability negotiation with our
-        uplink.
+        Handles the CAPAB command, used for capability negotiation with our uplink.
         """
-        # 5 CAPAB subcommands are usually sent on connect (excluding START and END):
-        #   CAPAB MODULES, MODSUPPORT, CHANMODES, USERMODES, and CAPABILITIES
-        # We check just about everything except MODULES
+        if not args:
+            return
 
-        if args[0] == 'START':
-            # Check the protocol version
-            # insp20:
-            # <- CAPAB START 1202
-            # insp3:
-            # <- CAPAB START 1205
+        subcmd = args[0].upper()
+
+        if subcmd == 'START':
+            # <- CAPAB START 1202 / 1205 / 1206
             self.remote_proto_ver = protocol_version = int(args[1])
 
-            log.debug("(%s) handle_capab: got remote protocol version %s", self.name, protocol_version)
+            log.debug("(%s) handle_capab: got remote protocol version %s (local target=%s, negotiated=%s)",
+                      self.name, protocol_version, self.proto_ver, self.negotiated_proto_ver)
             if protocol_version < self.proto_ver:
                 raise ProtocolError("Remote protocol version is too old! "
                                     "At least %s is needed. (got %s)" %
@@ -569,7 +607,7 @@ class InspIRCdProtocol(TS6BaseProtocol):
                             "and should not be relied upon for anything important.",
                             self.name)
             elif protocol_version >= 1206 > self.proto_ver:
-                log.warning("(%s) PyLink 3.1+ introduces native support for InspIRCd 4. "
+                log.warning("(%s) PyLink introduces native support for InspIRCd 4. "
                             "Enable this by setting 'target_version' to 'insp4' in your InspIRCd "
                             "server block. Otherwise, some features will not work correctly!",
                             self.name)
@@ -581,129 +619,107 @@ class InspIRCdProtocol(TS6BaseProtocol):
                             "work correctly!", self.name)
                 log.warning("(%s) Falling back to InspIRCd 2.0 (compatibility) mode.", self.name)
 
-            if self.proto_ver >= 1205:
-                # Clear mode lists, they will be negotiated during burst
+            if self.negotiated_proto_ver >= 1205:
+                # Clear mode lists; they will be negotiated during CAPAB
                 self.cmodes = {'*A': '', '*B': '', '*C': '', '*D': ''}
                 self.umodes = {'*A': '', '*B': '', '*C': '', '*D': ''}
                 self.prefixmodes.clear()
 
-        if args[0] in {'CHANMODES', 'USERMODES'}:
-            # insp20:
-            # <- CAPAB CHANMODES :admin=&a allowinvite=A autoop=w ban=b
-            #    banexception=e blockcolor=c c_registered=r exemptchanops=X
-            #    filter=g flood=f halfop=%h history=H invex=I inviteonly=i
-            #    joinflood=j key=k kicknorejoin=J limit=l moderated=m nickflood=F
-            #    noctcp=C noextmsg=n nokick=Q noknock=K nonick=N nonotice=T
-            #    official-join=!Y op=@o operonly=O opmoderated=U owner=~q
-            #    permanent=P private=p redirect=L reginvite=R regmoderated=M
-            #    secret=s sslonly=z stripcolor=S topiclock=t voice=+v
-            # <- CAPAB USERMODES :bot=B callerid=g cloak=x deaf_commonchan=c
-            #    helpop=h hidechans=I hideoper=H invisible=i oper=o regdeaf=R
-            #    servprotect=k showwhois=W snomask=s u_registered=r u_stripcolor=S
-            #    wallops=w
+        elif subcmd in {'CHANMODES', 'USERMODES'}:
+            mydict = self.cmodes if subcmd == 'CHANMODES' else self.umodes
 
-            # insp3:
-            # <- CAPAB CHANMODES :list:autoop=w list:ban=b list:banexception=e list:filter=g list:invex=I
-            #    list:namebase=Z param-set:anticaps=B param-set:flood=f param-set:joinflood=j param-set:kicknorejoin=J
-            #    param-set:limit=l param-set:nickflood=F param-set:redirect=L param:key=k prefix:10000:voice=+v
-            #    prefix:20000:halfop=%h prefix:30000:op=@o prefix:40000:admin=&a prefix:50000:founder=~q
-            #    prefix:9000000:official-join=!Y simple:allowinvite=A simple:auditorium=u simple:blockcolor=c
-            #    simple:c_registered=r simple:censor=G simple:inviteonly=i simple:moderated=m simple:noctcp=C
-            #    simple:noextmsg=n simple:nokick=Q simple:noknock=K simple:nonick=N simple:nonotice=T
-            #    simple:operonly=O simple:permanent=P simple:private=p simple:reginvite=R simple:regmoderated=M
-            #    simple:secret=s simple:sslonly=z simple:stripcolor=S simple:topiclock=t
-            # <- CAPAB USERMODES :param-set:snomask=s simple:antiredirect=L simple:bot=B simple:callerid=g simple:cloak=x
-            #    simple:deaf_commonchan=c simple:helpop=h simple:hidechans=I simple:hideoper=H simple:invisible=i
-            #    simple:oper=o simple:regdeaf=R simple:u_censor=G simple:u_registered=r simple:u_stripcolor=S
-            #    simple:wallops=w
-
-            mydict = self.cmodes if args[0] == 'CHANMODES' else self.umodes
-
-            # Named modes are essential for a cross-protocol IRC service. We
-            # can use InspIRCd as a model here and assign a similar mode map to
-            # our cmodes list.
             for modepair in args[-1].split():
+                if '=' not in modepair:
+                    continue
                 name, char = modepair.rsplit('=', 1)
+                if not char:
+                    continue
 
-                if self.proto_ver >= 1205:
-                    # Detect mode types from the mode type tag
+                if self.negotiated_proto_ver >= 1205:
                     parts = name.split(':')
                     modetype = parts[0]
                     name = parts[-1]
 
-                    # Modes are divided into A, B, C, and D classes
-                    # See http://www.irc.org/tech_docs/005.html
                     if modetype == 'simple':       # No parameter
-                        mydict['*D'] += char
-                    elif modetype == 'param-set':  # Only parameter when setting (e.g. cmode +l)
-                        mydict['*C'] += char
-                    elif modetype == 'param':      # Always has parameter (e.g. cmode +k)
-                        mydict['*B'] += char
-                    elif modetype == 'list':       # List modes like ban, except, invex, ...
-                        mydict['*A'] += char
+                        mydict['*D'] += char[-1]
+                    elif modetype == 'param-set':  # Only parameter when setting (e.g. +l)
+                        mydict['*C'] += char[-1]
+                    elif modetype == 'param':      # Always has parameter (e.g. +k)
+                        mydict['*B'] += char[-1]
+                    elif modetype == 'list':       # List modes like ban, except, invex...
+                        mydict['*A'] += char[-1]
                     elif modetype == 'prefix':     # prefix:30000:op=@o
-                        if args[0] != 'CHANMODES':  # This should never happen...
-                            log.warning("(%s) Possible desync? Got a prefix type modepair %r but not for channel modes", self.name, modepair)
+                        if subcmd != 'CHANMODES':
+                            log.warning("(%s) Possible desync? Got a prefix type modepair %r but not for channel modes",
+                                        self.name, modepair)
                         else:
-                            # We don't do anything with prefix levels yet, let's just store them for future use
-                            self._prefix_levels[name] = int(parts[1])
-
-                            # Map mode names to their prefixes
-                            self.prefixmodes[char[-1]] = char[0]
+                            if len(parts) >= 2 and parts[1].isdigit():
+                                self._prefix_levels[name] = int(parts[1])
+                            if len(char) >= 2:
+                                self.prefixmodes[char[-1]] = char[0]
 
                 # Strip c_, u_ prefixes to be consistent with other protocols.
                 if name.startswith(('c_', 'u_')):
                     name = name[2:]
 
-                if name == 'reginvite':  # Reginvite? That's an odd name.
+                if name == 'reginvite':
                     name = 'regonly'
-
-                if name == 'antiredirect':  # User mode +L
+                elif name == 'antiredirect':
                     name = 'noforward'
-
-                if name == 'founder':  # Channel mode +q
-                    # Founder, owner; same thing. m_customprefix allows you to name it anything you like,
-                    # but PyLink uses the latter in its definitions
+                elif name == 'founder':
                     name = 'owner'
-
-                if name in ('repeat', 'kicknorejoin'):
-                    # Suffix modes using inspircd-specific arguments so that it can
-                    # be safely relayed.
+                elif name in ('repeat', 'kicknorejoin'):
                     name += '_insp'
 
-                # Add the mode char to our table
                 mydict[name] = char[-1]
 
-        elif args[0] == 'CAPABILITIES':
-            # insp20:
-            # <- CAPAB CAPABILITIES :NICKMAX=21 CHANMAX=64 MAXMODES=20
-            # IDENTMAX=11 MAXQUIT=255 MAXTOPIC=307 MAXKICK=255 MAXGECOS=128
-            # MAXAWAY=200 IP6SUPPORT=1 PROTOCOL=1202 PREFIX=(Yqaohv)!~&@%+
-            # CHANMODES=IXbegw,k,FHJLfjl,ACKMNOPQRSTUcimnprstz
-            # USERMODES=,,s,BHIRSWcghikorwx GLOBOPS=1 SVSPART=1
+        elif subcmd == 'EXTBANS':
+            # InspIRCd 4 (1206):
+            # <- CAPAB EXTBANS :acting:mute=m matching:account=R matching:channel=j ...
+            for extban in args[-1].split():
+                if ':' not in extban:
+                    continue
+                exttype, rest = extban.split(':', 1)
+                if '=' in rest:
+                    extname, extchar = rest.split('=', 1)
+                    prefix = (extchar or extname) + ':'
+                else:
+                    extname = rest
+                    prefix = extname + ':'
 
-            # insp3:
-            # CAPAB CAPABILITIES :NICKMAX=30 CHANMAX=64 MAXMODES=20 IDENTMAX=10 MAXQUIT=255 MAXTOPIC=307
-            # MAXKICK=255 MAXREAL=128 MAXAWAY=200 MAXHOST=64 CHALLENGE=xxxxxxxxx CASEMAPPING=ascii GLOBOPS=1
+                extname_l = extname.lower()
+                if exttype == 'acting':
+                    mapped = INSP4_ACTING_EXTBAN_MAP.get(extname_l)
+                    if mapped:
+                        self.extbans_acting[mapped] = prefix
+                elif exttype == 'matching':
+                    mapped = INSP4_MATCHING_EXTBAN_MAP.get(extname_l)
+                    if mapped:
+                        self.extbans_matching[mapped] = prefix
 
-            # First, turn the arguments into a dict
+            log.debug('(%s) handle_capab: updated extbans_acting=%r extbans_matching=%r',
+                      self.name, self.extbans_acting, self.extbans_matching)
+
+        elif subcmd == 'CAPABILITIES':
             caps = self.parse_isupport(args[-1])
             log.debug("(%s) handle_capab: capabilities list is %s", self.name, caps)
 
-            # Store the max nick and channel lengths
-            nickmax = caps.get('NICKMAX') or caps.get('MAXNICK')
+            nickmax = caps.get('MAXNICK') or caps.get('NICKMAX')
             if nickmax:
                 self.maxnicklen = int(nickmax)
-            chanmax = caps.get('CHANMAX') or caps.get('MAXCHANNEL')
+
+            # Note: in InspIRCd 4, MAXCHANNEL is the max channels a user can join,
+            # while MAXCHAN (v4) / CHANMAX (v2/v3) is max channel name length.
+            chanmax = caps.get('MAXCHAN') or caps.get('CHANMAX')
             if chanmax:
                 self.maxchanlen = int(chanmax)
-            # Casemapping - this is only sent in InspIRCd 3.x
+
             if 'CASEMAPPING' in caps:
                 self.casemapping = caps['CASEMAPPING']
                 log.debug('(%s) handle_capab: updated casemapping to %s', self.name, self.casemapping)
 
-            # InspIRCd 2 only: mode & prefix definitions are sent as CAPAB CAPABILITIES CHANMODES/USERMODES/PREFIX
-            if self.proto_ver < 1205:
+            # InspIRCd 2 only: mode & prefix definitions are sent in CAPAB CAPABILITIES
+            if self.negotiated_proto_ver < 1205:
                 if 'CHANMODES' in caps:
                     self.cmodes['*A'], self.cmodes['*B'], self.cmodes['*C'], self.cmodes['*D'] \
                         = caps['CHANMODES'].split(',')
@@ -711,36 +727,29 @@ class InspIRCdProtocol(TS6BaseProtocol):
                     self.umodes['*A'], self.umodes['*B'], self.umodes['*C'], self.umodes['*D'] \
                         = caps['USERMODES'].split(',')
                 if 'PREFIX' in caps:
-                    # Separate the prefixes field (e.g. "(Yqaohv)!~&@%+") into a
-                    # dict mapping mode characters to mode prefixes.
                     self.prefixmodes = self.parse_isupport_prefixes(caps['PREFIX'])
                     log.debug('(%s) handle_capab: self.prefixmodes set to %r', self.name,
                               self.prefixmodes)
 
-        elif args[0] == 'MODSUPPORT':
-            # <- CAPAB MODSUPPORT :m_alltime.so m_check.so m_chghost.so m_chgident.so m_chgname.so m_fullversion.so m_gecosban.so m_knock.so m_muteban.so m_nicklock.so m_nopartmsg.so m_opmoderated.so m_sajoin.so m_sanick.so m_sapart.so m_serverban.so m_services_account.so m_showwhois.so m_silence.so m_swhois.so m_uninvite.so m_watch.so
+        elif subcmd in {'MODULES', 'MODSUPPORT'}:
             for module in args[-1].split():
                 self._add_module_support(module)
 
+        elif subcmd == 'END':
+            self._send_handshake()
+
     def handle_kick(self, source, command, args):
         """Handles incoming KICKs."""
-        # InspIRCD 3 adds membership IDs to KICK messages when forwarding across servers
-        # <- :3INAAAAAA KICK #endlessvoid 3INAAAAAA :test (local)
-        # <- :3INAAAAAA KICK #endlessvoid 7PYAAAAAA 0 :test (remote)
-        if self.proto_ver >= 1205 and len(args) > 3:
+        # InspIRCd 3/4 adds membership IDs to KICK messages when forwarding across servers
+        if self.negotiated_proto_ver >= 1205 and len(args) > 3:
             del args[2]
 
         return super().handle_kick(source, command, args)
 
     def handle_ping(self, source, command, args):
         """Handles incoming PING commands, so we don't time out."""
-        # InspIRCd 2:
-        # <- :70M PING 70M 0AL
-        # -> :0AL PONG 0AL 70M
-
-        # InspIRCd 3:
-        # <- :3IN PING 808
-        # -> :808 PONG 3IN
+        # InspIRCd 2: <- :70M PING 70M 0AL -> :0AL PONG 0AL 70M
+        # InspIRCd 3/4: <- :3IN PING 808 -> :808 PONG 3IN
         if len(args) >= 2:
             self._send_with_prefix(args[1], 'PONG %s %s' % (args[1], source), queue=False)
         else:
@@ -748,30 +757,26 @@ class InspIRCdProtocol(TS6BaseProtocol):
 
     def handle_fjoin(self, servernumeric, command, args):
         """Handles incoming FJOIN commands (InspIRCd equivalent of JOIN/SJOIN)."""
-        # insp2:
-        # <- :70M FJOIN #chat 1423790411 +AFPfjnt 6:5 7:5 9:5 :o,1SRAABIT4 v,1IOAAF53R <...>
-        # insp3:
-        # <- :3IN FJOIN #test 1556842195 +nt :o,3INAAAAAA:4
+        # insp2: <- :70M FJOIN #chat 1423790411 +AFPfjnt 6:5 7:5 9:5 :o,1SRAABIT4 v,1IOAAF53R
+        # insp3/4: <- :3IN FJOIN #test 1556842195 +nt :o,3INAAAAAA:4
         channel = args[0]
         chandata = self._channels[channel].deepcopy()
-        # InspIRCd sends each channel's users in the form of 'modeprefix(es),UID'
-        userlist = args[-1].split()
+        userlist = args[-1].split() if args[-1] else []
 
-        modestring = args[2:-1] or args[2]
+        modestring = args[2:-1] or [args[2]]
         parsedmodes = self.parse_modes(channel, modestring)
         namelist = []
-
-        # Keep track of other modes that are added due to prefix modes being joined too.
         changedmodes = set(parsedmodes)
 
-        for user in userlist:
-            modeprefix, user = user.split(',', 1)
+        for entry in userlist:
+            if ',' not in entry:
+                continue
+            modeprefix, user = entry.split(',', 1)
 
-            if self.proto_ver >= 1205:
-                # XXX: we don't handle membership IDs yet
+            if self.negotiated_proto_ver >= 1205:
+                # Strip membership ID (<uid>:<membid>)
                 user = user.split(':', 1)[0]
 
-            # Don't crash when we get an invalid UID.
             if user not in self.users:
                 log.debug('(%s) handle_fjoin: tried to introduce user %s not in our user list, ignoring...',
                           self.name, user)
@@ -779,66 +784,70 @@ class InspIRCdProtocol(TS6BaseProtocol):
 
             namelist.append(user)
             self.users[user].channels.add(channel)
-
-            # Only save mode changes if the remote has lower TS than us.
             changedmodes |= {('+%s' % mode, user) for mode in modeprefix}
-
             self._channels[channel].users.add(user)
 
-        # Statekeeping with timestamps. Note: some service packages (Anope 1.8) send a trailing
-        # 'd' after the timestamp, which we should strip out to prevent int() from erroring.
-        # This is technically valid in InspIRCd S2S because atoi() ignores non-digit characters,
-        # but it's strange behaviour either way...
-        # <- :3AX FJOIN #monitor 1485462109d + :,3AXAAAAAK
         their_ts = int(''.join(char for char in args[1] if char.isdigit()))
-
-        our_ts = self._channels[channel].ts
         self.updateTS(servernumeric, channel, their_ts, changedmodes)
 
         return {'channel': channel, 'users': namelist, 'modes': parsedmodes, 'ts': their_ts,
                 'channeldata': chandata}
 
     def handle_ijoin(self, source, command, args):
-        """Handles InspIRCd 3 joins with membership ID."""
-        # insp3:
-        # EX: regular /join on an existing channel
-        # <- :3INAAAAAA IJOIN #valhalla 6
-
-        # EX: /ojoin on an existing channel
-        # <- :3INAAAAAA IJOIN #valhalla 7 1559348434 Yo
-
-        # From insp3 source:
+        """Handles InspIRCd 3/4 joins with membership ID."""
         # <- :<uid> IJOIN <chan> <membid> [<ts> [<flags>]]
-        #   args idx:      0      1         2     3
-
-        # For now we don't care about the membership ID
         channel = args[0]
         self.users[source].channels.add(channel)
         self._channels[channel].users.add(source)
 
-        # Apply prefix modes if they exist and the TS check passes
-        if len(args) >= 4 and int(args[2]) <= self._channels[channel].ts:
-            self.apply_modes(source, {('+%s' % mode, source) for mode in args[3]})
+        if len(args) >= 3:
+            their_ts = int(''.join(char for char in args[2] if char.isdigit()))
+            changedmodes = {('+%s' % mode, source) for mode in args[3]} if len(args) >= 4 else set()
+            self.updateTS(source, channel, their_ts, changedmodes)
 
-        return {'channel': channel, 'users': [source], 'modes':
-                self._channels[channel].modes}
+        return {'channel': channel, 'users': [source], 'modes': self._channels[channel].modes}
+
+    def handle_lmode(self, numeric, command, args):
+        """Handles InspIRCd 4 LMODE commands (bursting channel list modes like +b/+e/+I)."""
+        # <- :36D LMODE #chan 1234567890 b *!*@bad.host 1234567891 setter *!*@other.host 1234567892 setter
+        if len(args) < 3:
+            log.debug('(%s) handle_lmode: ignoring malformed LMODE %r', self.name, args)
+            return
+
+        channel = args[0]
+        their_ts = int(''.join(char for char in args[1] if char.isdigit()))
+        modechar = args[2]
+        oldobj = self._channels[channel].deepcopy()
+
+        changedmodes = []
+        entries = args[3:]
+        for i in range(0, len(entries), 3):
+            changedmodes.append(('+%s' % modechar, entries[i]))
+
+        if changedmodes:
+            self.updateTS(numeric, channel, their_ts, changedmodes)
+
+        return {'target': channel, 'modes': changedmodes, 'ts': their_ts,
+                'channeldata': oldobj}
 
     def handle_uid(self, numeric, command, args):
         """Handles incoming UID commands (user introduction)."""
-        # :70M UID 70MAAAAAB 1429934638 jlu5 0::1 hidden-7j810p.9mdf.lrek.0000.0000.IP jlu5 0::1 1429934638 +Wioswx +ACGKNOQXacfgklnoqvx :realname
         uid = args[0]
         ts = int(args[1])
         nick = args[2]
         realhost = args[3]
+        host = args[4]
 
-        if getattr(self, 'remote_proto_ver', self.proto_ver) >= 1206:
-            host = args[4]
+        if self.negotiated_proto_ver >= 1206:
+            # InspIRCd 4 (1206):
+            # :<sid> UID <uid> <age> <nick> <realhost> <dhost> <realuser> <duser> <ip> <signon> <modes> [<params>...] :<realname>
             realident = args[5]
             ident = args[6]
             ip = args[7]
             signon_idx = 8
         else:
-            host = args[4]
+            # InspIRCd 2/3 (1202/1205):
+            # :<sid> UID <uid> <age> <nick> <realhost> <dhost> <duser> <ip> <signon> <modes> [<params>...] :<realname>
             ident = args[5]
             realident = ident
             ip = args[6]
@@ -849,40 +858,43 @@ class InspIRCdProtocol(TS6BaseProtocol):
         self.users[uid] = userobj = User(self, nick, ts, uid, numeric, ident, host, realname, realhost, ip)
         userobj.realident = realident
 
-        mode_tokens = args[signon_idx + 1:-1]
-        if not mode_tokens:
-            mode_tokens = ['+']
-        elif len(mode_tokens) == 1:
-            mode_tokens.append('+')
+        mode_tokens = args[signon_idx + 1:-1] or ['+']
         parsedmodes = self.parse_modes(uid, mode_tokens)
         self.apply_modes(uid, parsedmodes)
 
         self._check_oper_status_change(uid, parsedmodes)
 
         self.servers[numeric].users.add(uid)
-        # InspIRCd sends SSL status in the metadata command, so the info is not known at this point
-        return {'uid': uid, 'ts': ts, 'nick': nick, 'realhost': realhost, 'host': host, 'ident': ident, 'ip': ip, 'secure': None}
+        # InspIRCd sends SSL status in METADATA, so it is not known yet at UID time
+        return {'uid': uid, 'ts': ts, 'nick': nick, 'realhost': realhost, 'host': host,
+                'ident': ident, 'ip': ip, 'secure': None}
 
     def handle_server(self, source, command, args):
         """Handles incoming SERVER commands (introduction of servers)."""
-
         if self.uplink is None:
-            # <- SERVER whatever.net abcdefgh 0 10X :some server description
+            # Direct uplink introduction:
+            # insp20: SERVER <name> <pass> <hops> <sid> :<desc>
+            # insp3:  SERVER <name> <pass> [0] <sid> [k=v...] :<desc>
+            # insp4:  SERVER <name> <pass> <sid> [k=v...] :<desc>
             servername = args[0].lower()
-            if self.proto_ver >= 1205:
-                try:
-                    source = args[2]
-                except IndexError:
-                    raise ProtocolError('Malformed SERVER introduction from uplink (missing SID)')
-            else:
-                try:
-                    source = args[3]
-                except IndexError:
-                    raise ProtocolError('Malformed SERVER introduction from uplink (missing SID)')
+            if len(args) < 4:
+                raise ProtocolError('Malformed SERVER introduction from uplink: %r' % (args,))
 
             if args[1] != self.serverdata['recvpass']:
-                 # Check if recvpass is correct
-                 raise ProtocolError('recvpass from uplink server %s does not match configuration!' % servername)
+                raise ProtocolError('recvpass from uplink server %s does not match configuration!' % servername)
+
+            if self.negotiated_proto_ver >= 1206:
+                source = args[2]
+            elif self.negotiated_proto_ver >= 1205:
+                # Some InspIRCd 3.x builds include the legacy hopcount '0' before SID
+                if len(args) >= 5 and args[2].isdigit() and len(args[2]) < 3:
+                    source = args[3]
+                else:
+                    source = args[2]
+            else:
+                if len(args) < 5:
+                    raise ProtocolError('Malformed SERVER introduction from uplink (missing SID)')
+                source = args[3]
 
             sdesc = args[-1]
             self.servers[source] = Server(self, None, servername, desc=sdesc)
@@ -890,16 +902,14 @@ class InspIRCdProtocol(TS6BaseProtocol):
             log.debug('(%s) inspircd: found uplink %s', self.name, self.uplink)
             return
 
-        # Other server introductions.
-        # insp20:
-        # <- :00A SERVER test.server * 1 00C :testing raw message syntax
-        # insp3:
-        # <- :3IN SERVER services.abc.local 0SV :Some server
+        # Indirect server introductions:
+        # insp20: :<uplink> SERVER <name> * <hops> <sid> :<desc>
+        # insp3/4: :<uplink> SERVER <name> <sid> [hidden=0 burst=...] :<desc>
         servername = args[0].lower()
-        if self.proto_ver >= 1205:
-            sid = args[1]  # insp3
+        if self.negotiated_proto_ver >= 1205:
+            sid = args[1]
         else:
-            sid = args[3]  # insp20
+            sid = args[3]
         sdesc = args[-1]
         self.servers[sid] = Server(self, source, servername, desc=sdesc)
 
@@ -907,7 +917,6 @@ class InspIRCdProtocol(TS6BaseProtocol):
 
     def handle_fmode(self, numeric, command, args):
         """Handles the FMODE command, used for channel mode changes."""
-        # <- :70MAAAAAA FMODE #chat 1433653462 +hhT 70MAAAAAA 70MAAAAAD
         channel = args[0]
         oldobj = self._channels[channel].deepcopy()
         modes = args[2:]
@@ -918,38 +927,20 @@ class InspIRCdProtocol(TS6BaseProtocol):
                 'channeldata': oldobj}
 
     def handle_idle(self, source, command, args):
-        """
-        Handles the IDLE command, sent between servers in remote WHOIS queries.
-        """
-        # <- :70MAAAAAA IDLE 1MLAAAAIG
-        # -> :1MLAAAAIG IDLE 70MAAAAAA 1433036797 319
-
+        """Handles the IDLE command, sent between servers in remote WHOIS queries."""
         if self.serverdata.get('force_whois_extensions', True):
             return {'target': args[0], 'parse_as': 'WHOIS'}
 
-        # Allow hiding the startup time if set to do so (if both idle and signon time is 0, InspIRCd omits
-        # showing this line).
         target = args[0]
         start_time = self.start_ts if (conf.conf['pylink'].get('whois_show_startup_time', True) and
                                        self.get_service_bot(target)) else 0
-
-        # First arg = source, second = signon time, third = idle time
         self._send_with_prefix(target, 'IDLE %s %s 0' % (source, start_time))
 
     def handle_ftopic(self, source, command, args):
         """Handles incoming topic changes."""
-        # insp2 (only used for server senders):
-        # <- :70M FTOPIC #channel 1434510754 jlu5!jlu5@escape.the.dreamland.ca :Some channel topic
-
-        # insp3 (used for server AND user senders):
-        # <- :3IN FTOPIC #qwerty 1556828864 1556844505 jlu5!jlu5@midnight-umk.of4.0.127.IP :1234abcd
-        # <- :3INAAAAAA FTOPIC #qwerty 1556828864 1556844248 :topic text
-        #           chan creation time ^          ^ topic set time (the one we want)
-
-        # <- :00A SVSTOPIC #channel 1538402416 SomeUser :test
         channel = args[0]
 
-        if self.proto_ver >= 1205 and command == 'FTOPIC':
+        if self.negotiated_proto_ver >= 1205 and command == 'FTOPIC':
             ts = args[2]
             if source in self.users:
                 setter = source
@@ -965,32 +956,23 @@ class InspIRCdProtocol(TS6BaseProtocol):
         self._channels[channel].topicset = True
         return {'channel': channel, 'setter': setter, 'ts': ts, 'text': topic}
 
-    # SVSTOPIC is used by InspIRCd module m_topiclock - its arguments are the same as insp2 FTOPIC
+    # SVSTOPIC is used by InspIRCd module topiclock - its arguments are the same as insp2 FTOPIC
     handle_svstopic = handle_ftopic
 
     def handle_opertype(self, target, command, args):
-        """Handles incoming OPERTYPE, which is used to denote an oper up.
+        """Handles incoming OPERTYPE, which is used to denote an oper up."""
+        opertype = args[0]
+        if self.negotiated_proto_ver < 1205:
+            opertype = opertype.replace("_", " ")
 
-        This calls the internal hook CLIENT_OPERED, sets the internal
-        opertype of the client, and assumes setting user mode +o on the caller."""
-        # This is used by InspIRCd to denote an oper up; there is no MODE
-        # command sent for it.
-        # <- :70MAAAAAB OPERTYPE Network_Owner
-        # Replace escaped _ in opertypes with spaces for InspIRCd 2.0.
-        opertype = args[0].replace("_", " ")
-
-        # Set umode +o on the target.
         omode = [('+o', None)]
         self.apply_modes(target, omode)
 
-        # Call the CLIENT_OPERED hook that protocols use. The MODE hook
-        # payload is returned below.
         self.call_hooks([target, 'CLIENT_OPERED', {'text': opertype}])
         return {'target': target, 'modes': omode}
 
     def handle_fident(self, numeric, command, args):
         """Handles FIDENT, used for denoting ident changes."""
-        # <- :70MAAAAAB FIDENT test
         display_ident = args[0]
         real_ident = args[1] if len(args) > 1 else None
 
@@ -1003,7 +985,6 @@ class InspIRCdProtocol(TS6BaseProtocol):
 
     def handle_fhost(self, numeric, command, args):
         """Handles FHOST, used for denoting hostname changes."""
-        # <- :70MAAAAAB FHOST some.host
         display_host = args[0]
         real_host = args[1] if len(args) > 1 else None
 
@@ -1016,7 +997,6 @@ class InspIRCdProtocol(TS6BaseProtocol):
 
     def handle_fname(self, numeric, command, args):
         """Handles FNAME, used for denoting real name/gecos changes."""
-        # <- :70MAAAAAB FNAME :afdsafasf
         self.users[numeric].realname = newgecos = args[0]
         return {'target': numeric, 'newgecos': newgecos}
 
@@ -1029,36 +1009,18 @@ class InspIRCdProtocol(TS6BaseProtocol):
 
     def handle_away(self, numeric, command, args):
         """Handles incoming AWAY messages."""
-        # <- :1MLAAAAIG AWAY 1439371390 :Auto-away
         try:
             ts = args[0]
             self.users[numeric].away = text = args[1]
             return {'text': text, 'ts': ts}
-        except IndexError:  # User is unsetting away status
+        except IndexError:
             self.users[numeric].away = ''
             return {'text': ''}
 
     def handle_rsquit(self, numeric, command, args):
-        """
-        Handles the RSQUIT command, which is sent by opers to SQUIT remote
-        servers.
-        """
-        # <- :1MLAAAAIG RSQUIT :ayy.lmao
-        # <- :1MLAAAAIG RSQUIT ayy.lmao :some reason
-
-        # RSQUIT is sent by opers to SQUIT remote servers. However, it differs from
-        # a regular SQUIT in that:
-        #    1) It takes a server name instead of a SID,
-        #    2) Responses have to be be explicitly sent; i.e. The target server has
-        #       to agree with splitting the target, and could ignore such requests
-        #       entirely.
-
-        # If we receive such a remote SQUIT, just forward it as a regular
-        # SQUIT, in order to be consistent with other IRCds which make SQUITs
-        # implicit.
+        """Handles the RSQUIT command, sent by opers to SQUIT remote servers."""
         target = self._get_SID(args[0])
         if self.is_internal_server(target):
-            # The target has to be one of our servers in order to work...
             uplink = self.servers[target].uplink
             reason = 'Requested by %s' % self.get_hostmask(numeric)
             self._send_with_prefix(uplink, 'SQUIT %s :%s' % (target, reason))
@@ -1069,57 +1031,73 @@ class InspIRCdProtocol(TS6BaseProtocol):
 
     def handle_metadata(self, numeric, command, args):
         """
-        Handles the METADATA command, used by servers to send metadata for various objects.
+        Handles the METADATA command across InspIRCd 2/3/4:
+        - Network/Server: METADATA * <key> [:<value>]
+        - User:           METADATA <uid> <key> [:<value>]
+        - Channel:        METADATA <#chan> <ts> <key> [:<value>]
+        - Membership v4:  METADATA @ <uid> <#chan> <ts> <membid> <key> [:<value>]
         """
-        uid = args[0]
+        if len(args) < 2:
+            return
 
-        if args[1] == 'accountname' and uid in self.users:
-            # <- :00A METADATA 1MLAAAJET accountname :
-            # <- :00A METADATA 1MLAAAJET accountname :tester
-            # Sets the services login name of the client.
-            self.call_hooks([uid, 'CLIENT_SERVICES_LOGIN', {'text': args[-1]}])
+        target = args[0]
 
-        elif args[1] == 'modules' and numeric == self.uplink:
-            # Note: only handle METADATA from our uplink; otherwise leaf servers unloading modules
-            # while shutting down will corrupt the state.
-            # <- :70M METADATA * modules :-m_chghost.so
-            # <- :70M METADATA * modules :+m_chghost.so
-            for module in args[-1].split():
-                if module.startswith('-'):
-                    log.debug('(%s) Removing module %s', self.name, module[1:])
-                    self._remove_module_support(module[1:])
-                elif module.startswith('+'):
-                    log.debug('(%s) Adding module %s', self.name, module[1:])
-                    self._add_module_support(module[1:])
-                else:
-                    log.warning('(%s) Got unknown METADATA modules string: %r', self.name, args[-1])
-        elif args[1] == 'ssl_cert' and uid in self.users:
-            self.users[uid].ssl = True
+        # InspIRCd 4 membership metadata - currently unused by PyLink
+        if target == '@':
+            return
+
+        # Channel metadata (METADATA #chan <ts> <key> [:<value>])
+        if self.is_channel(target):
+            return
+
+        key = args[1]
+        value = args[2] if len(args) >= 3 else ''
+
+        if target == '*':
+            if key == 'modules' and numeric == self.uplink:
+                for module in value.split():
+                    if module.startswith('-'):
+                        log.debug('(%s) Removing module %s', self.name, module[1:])
+                        self._remove_module_support(module[1:])
+                    elif module.startswith('+'):
+                        log.debug('(%s) Adding module %s', self.name, module[1:])
+                        self._add_module_support(module[1:])
+                    else:
+                        log.warning('(%s) Got unknown METADATA modules string: %r', self.name, value)
+        elif target in self.users:
+            if key == 'accountname':
+                self.call_hooks([target, 'CLIENT_SERVICES_LOGIN', {'text': value}])
+            elif key in ('ssl_cert', 'tls_cert'):
+                self.users[target].ssl = bool(value)
 
     def handle_version(self, numeric, command, args):
-        """
-        Stub VERSION handler (does nothing) to override the one in ts6_common.
-        """
+        """Stub VERSION handler to override the one in ts6_common."""
+
+    def handle_burst(self, numeric, command, args):
+        """Stub BURST handler."""
+
+    def handle_sinfo(self, numeric, command, args):
+        """Stub SINFO handler."""
+
+    def handle_tagmsg(self, numeric, command, args):
+        """Stub TAGMSG handler (IRCv3 client tags forwarded over InspIRCd 4 S2S)."""
+
+    def handle_resync(self, numeric, command, args):
+        """Stub RESYNC handler (InspIRCd 4 channel resync request)."""
 
     def handle_sakick(self, source, command, args):
         """Handles forced kicks (SAKICK)."""
-        # <- :1MLAAAAAD ENCAP 0AL SAKICK #test 0ALAAAAAB :test
-        # ENCAP -> SAKICK args: ['#test', '0ALAAAAAB', 'test']
-
         target = args[1]
         channel = args[0]
         try:
             reason = args[2]
         except IndexError:
-            # Kick reason is optional, strange...
             reason = self.get_friendly_name(source)
 
         if not self.is_internal_client(target):
             log.warning("(%s) Got SAKICK for client that not one of ours: %s", self.name, target)
             return
         else:
-            # Like RSQUIT, SAKICK requires that the receiving server acknowledge that a kick has
-            # happened. This comes from the server hosting the target client.
             server = self.get_server(target)
 
         self.kick(server, channel, target, reason)
@@ -1127,11 +1105,9 @@ class InspIRCdProtocol(TS6BaseProtocol):
 
     def handle_alltime(self, source, command, args):
         """Handles /ALLTIME requests."""
-        # -> :9PYAAAAAA ENCAP * ALLTIME
-        # <- :70M PUSH 0ALAAAAAC ::midnight.vpn NOTICE PyLink-devel :System time is 2016-08-13 02:23:06 (1471054986) on midnight.vpn
-
-        # XXX: We override notice() here because that abstraction doesn't allow messages from servers.
         timestring = '%s (%s)' % (time.strftime('%Y-%m-%d %H:%M:%S'), int(time.time()))
-        self._send_with_prefix(self.sid, 'NOTICE %s :System time is %s on %s' % (source, timestring, self.hostname()))
+        self._send_with_prefix(self.sid, 'NOTICE %s :System time is %s on %s' %
+                               (source, timestring, self.hostname()))
+
 
 Class = InspIRCdProtocol
